@@ -22,7 +22,7 @@ D, K = 576, 4
 
 def _load_blob():
     parts = sorted(glob.glob(os.path.join(HERE, "weights", "part*.txt")))
-    return "".join(open(p).read().split() for p in parts)
+    return "".join("".join(open(p).read().split()) for p in parts)
 
 
 class VegetableNet(nn.Module):
@@ -37,7 +37,6 @@ class VegetableNet(nn.Module):
 
 
 def load():
-    """权重格式：int8(4x576) + scale(4, float32) + bias(4, float32)"""
     raw = base64.b64decode(_load_blob())
     Wq = np.frombuffer(raw[:D * K], dtype=np.int8).reshape(K, D).astype(np.float32)
     scale = np.frombuffer(raw[D * K:D * K + K * 4], dtype=np.float32)
