@@ -1,15 +1,15 @@
 # -*- coding: utf-8 -*-
-"""训练：MobileNetV3-Small 冻结特征 + 逻辑回归分类头
+"""训练 4 分类：白菜 / 花菜 / 青椒 / 其他
 
-数据目录结构：
-    data_clean/baicai/*.jpg
-    data_clean/not_baicai/*.jpg
-    clean_list.json   ->  {"keep": {"baicai": [...], "not_baicai": [...]}}
+MobileNetV3-Small 冻结特征 + 逻辑回归分类头
 
-输出：
-    白菜识别模型.pt      （完整 PyTorch 权重）
-    head_b64.txt         （仅分类头的 fp16 base64，1.5KB）
-    metrics.json         （指标）
+目录结构：
+    data_clean/baicai/*.jpg        白菜
+    veg_clean/huacai/*.jpg         花菜
+    veg_clean/qingjiao/*.jpg       青椒
+    data_clean/not_baicai/*.jpg    其他（含卷心菜、生菜、水果、汽车等，见 clean_list.json 白名单）
+
+输出：head_b64.txt（int8 量化的分类头）、cabbage_model.pt、metrics.json
 """
 import os, random, json, base64
 import numpy as np, torch, torch.nn as nn
@@ -21,19 +21,27 @@ from PIL import Image
 
 random.seed(2026); np.random.seed(2026); torch.manual_seed(2026)
 torch.set_num_threads(2)
-CLASSES = ["baicai", "not_baicai"]; NAMES = {"baicai": "白菜", "not_baicai": "不是白菜"}
+CLASSES = ["baicai", "huacai", "qingjiao", "other"]
+NAMES = {"baicai": "白菜", "huacai": "花菜", "qingjiao": "青椒", "other": "其他"}
 MEAN = [0.485, 0.456, 0.406]; STD = [0.229, 0.224, 0.225]
+D, K = 576, 4
 
 keep = json.load(open("clean_list.json"))["keep"]
-items = [(os.path.join("data_clean", c, f), ci) for ci, c in enumerate(CLASSES) for f in keep[c]]
+items = [(os.path.join("data_clean", "baicai", f), 0) for f in keep["baicai"]]
+items += [(os.path.join("veg_clean", "huacai", f), 1) for f in sorted(os.listdir("veg_clean/huacai"))]
+items += [(os.path.join("veg_clean", "qingjiao", f), 2) for f in sorted(os.listdir("veg_clean/qingjiao"))]
+items += [(os.path.join("data_clean", "not_baicai", f), 3) for f in keep["not_baicai"]]
+
+from collections import Counter
+print("各类样本:", {NAMES[CLASSES[c]]: n for c, n in Counter([i[1] for i in items]).items()})
+
 random.shuffle(items)
-tr, va, cnt = [], [], {0: 0, 1: 0}
+tr, va, cnt = [], [], {i: 0 for i in range(4)}
 for p, c in items:
     (va if cnt[c] % 5 == 0 else tr).append((p, c)); cnt[c] += 1
 print("train", len(tr), "val", len(va))
 
-w = MobileNet_V3_Small_Weights.IMAGENET1K_V1
-m = mobilenet_v3_small(weights=w).eval()
+m = mobilenet_v3_small(weights=MobileNet_V3_Small_Weights.IMAGENET1K_V1).eval()
 backbone = nn.Sequential(m.features, nn.AdaptiveAvgPool2d(1), nn.Flatten())
 for p in backbone.parameters(): p.requires_grad_(False)
 prep = transforms.Compose([transforms.Resize(256), transforms.CenterCrop(224),
@@ -51,20 +59,18 @@ Xtr = feats([p for p, _ in tr]); ytr = np.array([c for _, c in tr])
 Xva = feats([p for p, _ in va]); yva = np.array([c for _, c in va])
 clf = LogisticRegression(max_iter=3000, C=1.0, class_weight="balanced").fit(Xtr, ytr)
 pred = clf.predict(Xva)
-acc = accuracy_score(yva, pred)
-print("验证集准确率: %.4f" % acc)
+print("验证集准确率: %.4f" % accuracy_score(yva, pred))
 print(classification_report(yva, pred, target_names=[NAMES[c] for c in CLASSES], digits=4))
-print(confusion_matrix(yva, pred))
+print("混淆矩阵(行=真实,列=预测):"); print(confusion_matrix(yva, pred))
 
-W = clf.coef_; b = clf.intercept_
-if W.shape[0] == 1:
-    W = np.vstack([np.zeros_like(W), W]); b = np.array([0.0, b[0]], dtype=np.float32)
+W = clf.coef_.astype(np.float32); b = clf.intercept_.astype(np.float32)
+# int8 量化打包：权重 + 每行 scale + 偏置
+scale = np.abs(W).max(axis=1, keepdims=True) / 127.0
+Wq = np.round(W / scale).astype(np.int8)
+blob = Wq.tobytes() + scale.ravel().astype(np.float32).tobytes() + b.tobytes()
+open("head_b64.txt", "w").write(base64.b64encode(blob).decode())
 
-# 保存分类头（fp16 base64，predict.py 直接读这个）
-blob = np.concatenate([W[1].astype(np.float16), np.array([b[1]], dtype=np.float16)])
-open("head_b64.txt", "w").write(base64.b64encode(blob.tobytes()).decode())
-
-class CabbageNet(nn.Module):
+class Net(nn.Module):
     def __init__(self, backbone, W, b):
         super().__init__(); self.backbone = backbone
         self.head = nn.Linear(W.shape[1], W.shape[0])
@@ -72,11 +78,8 @@ class CabbageNet(nn.Module):
         self.head.bias.data = torch.from_numpy(b).float()
     def forward(self, x): return self.head(self.backbone(x))
 
-net = CabbageNet(backbone, W, b).eval()
-torch.save({"state_dict": net.state_dict(), "classes": CLASSES, "img_size": 224,
-            "mean": MEAN, "std": STD, "val_acc": float(acc)}, "cabbage_model.pt")
-json.dump({"val_acc": float(acc), "n_train": len(tr), "n_val": len(va),
-           "cabbage_recall": float(((yva == 0) & (pred == 0)).sum() / max(1, (yva == 0).sum())),
-           "cabbage_precision": float(((pred == 0) & (yva == 0)).sum() / max(1, (pred == 0).sum()))},
+torch.save({"state_dict": Net(backbone, W, b).state_dict(), "classes": CLASSES,
+            "img_size": 224, "mean": MEAN, "std": STD}, "cabbage_model.pt")
+json.dump({"val_acc": float(accuracy_score(yva, pred)), "n_train": len(tr), "n_val": len(va)},
           open("metrics.json", "w"), ensure_ascii=False, indent=2)
-print("已保存 cabbage_model.pt 与 head_b64.txt")
+print("已保存 head_b64.txt 与 cabbage_model.pt")

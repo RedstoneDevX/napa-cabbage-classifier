@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-"""白菜识别模型（napa cabbage vs not）
+"""蔬菜识别模型（白菜 / 花菜 / 青椒 / 其他）
 
     python3 predict.py 图片.jpg
     python3 predict.py 某个文件夹/
 
-模型 = torchvision 的 MobileNetV3-Small(ImageNet 预训练，冻结) + 一个线性分类头。
-分类头权重只有 577 个 fp16 数，存成 head_b64.txt（1.5KB base64），不占仓库体积。
+模型 = torchvision 的 MobileNetV3-Small(ImageNet 预训练，冻结) + 线性分类头。
+分类头是 int8 量化后的 4×576 权重，存成 head_b64.txt（3KB base64），不占仓库体积。
 """
 import sys, os, glob, base64
 import numpy as np, torch, torch.nn as nn
@@ -14,8 +14,10 @@ from torchvision.models import mobilenet_v3_small, MobileNet_V3_Small_Weights
 from PIL import Image
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-CLASSES = ["baicai", "not_baicai"]          # 0=白菜, 1=不是白菜
+CLASSES = ["baicai", "huacai", "qingjiao", "other"]
+LABELS = {"baicai": "白菜", "huacai": "花菜", "qingjiao": "青椒", "other": "其他"}
 MEAN, STD = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
+D, K = 576, 4
 
 
 class CabbageNet(nn.Module):
@@ -23,19 +25,21 @@ class CabbageNet(nn.Module):
         super().__init__()
         m = mobilenet_v3_small(weights=MobileNet_V3_Small_Weights.IMAGENET1K_V1)
         self.backbone = nn.Sequential(m.features, nn.AdaptiveAvgPool2d(1), nn.Flatten())
-        self.head = nn.Linear(576, 2)
+        self.head = nn.Linear(D, K)
 
     def forward(self, x):
         return self.head(self.backbone(x))
 
 
 def load(weights_path=os.path.join(HERE, "head_b64.txt")):
-    blob = base64.b64decode(open(weights_path).read().strip())
-    arr = np.frombuffer(blob, dtype=np.float16).astype(np.float32)   # 576 + 1
-    w, b = arr[:576], arr[576]
+    """head_b64.txt = int8 权重(4x576) + 每行 scale(4, float32) + 偏置(4, float32)"""
+    raw = base64.b64decode(open(weights_path).read().strip())
+    Wq = np.frombuffer(raw[:D * K], dtype=np.int8).reshape(K, D).astype(np.float32)
+    scale = np.frombuffer(raw[D * K:D * K + K * 4], dtype=np.float32)
+    b = np.frombuffer(raw[D * K + K * 4:], dtype=np.float32)
     net = CabbageNet()
-    net.head.weight.data = torch.tensor(np.vstack([np.zeros(576), w]), dtype=torch.float32)
-    net.head.bias.data = torch.tensor([0.0, b], dtype=torch.float32)
+    net.head.weight.data = torch.tensor(Wq * scale[:, None], dtype=torch.float32)
+    net.head.bias.data = torch.tensor(b, dtype=torch.float32)
     net.eval()
     prep = transforms.Compose([transforms.Resize(256), transforms.CenterCrop(224),
                                transforms.ToTensor(), transforms.Normalize(MEAN, STD)])
@@ -57,5 +61,4 @@ if __name__ == "__main__":
     for f in files:
         if not f.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".webp")): continue
         name, conf = predict(f, net, prep)
-        label = "白菜" if name == "baicai" else "不是白菜"
-        print(f"{os.path.basename(f)}  ->  {label}  (置信度 {conf*100:.1f}%)")
+        print(f"{os.path.basename(f)}  ->  {LABELS[name]}  (置信度 {conf*100:.1f}%)")
