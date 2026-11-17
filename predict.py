@@ -5,7 +5,7 @@
     python3 predict.py 某个文件夹/
 
 模型 = torchvision 的 MobileNetV3-Small(ImageNet 预训练，冻结) + 线性分类头。
-分类头是 int8 量化后的 4×576 权重，存成 head_b64.txt（3KB base64），不占仓库体积。
+分类头是 int8 量化后的 4×576 权重，拆成 weights/part0..3.txt（共约 3KB），不占仓库体积。
 """
 import sys, os, glob, base64
 import numpy as np, torch, torch.nn as nn
@@ -20,7 +20,12 @@ MEAN, STD = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
 D, K = 576, 4
 
 
-class CabbageNet(nn.Module):
+def _load_blob():
+    parts = sorted(glob.glob(os.path.join(HERE, "weights", "part*.txt")))
+    return "".join(open(p).read().split() for p in parts)
+
+
+class VegetableNet(nn.Module):
     def __init__(self):
         super().__init__()
         m = mobilenet_v3_small(weights=MobileNet_V3_Small_Weights.IMAGENET1K_V1)
@@ -31,13 +36,13 @@ class CabbageNet(nn.Module):
         return self.head(self.backbone(x))
 
 
-def load(weights_path=os.path.join(HERE, "head_b64.txt")):
-    """head_b64.txt = int8 权重(4x576) + 每行 scale(4, float32) + 偏置(4, float32)"""
-    raw = base64.b64decode(open(weights_path).read().strip())
+def load():
+    """权重格式：int8(4x576) + scale(4, float32) + bias(4, float32)"""
+    raw = base64.b64decode(_load_blob())
     Wq = np.frombuffer(raw[:D * K], dtype=np.int8).reshape(K, D).astype(np.float32)
     scale = np.frombuffer(raw[D * K:D * K + K * 4], dtype=np.float32)
     b = np.frombuffer(raw[D * K + K * 4:], dtype=np.float32)
-    net = CabbageNet()
+    net = VegetableNet()
     net.head.weight.data = torch.tensor(Wq * scale[:, None], dtype=torch.float32)
     net.head.bias.data = torch.tensor(b, dtype=torch.float32)
     net.eval()
