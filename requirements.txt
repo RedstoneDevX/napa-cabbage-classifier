@@ -1,0 +1,7 @@
+torch>=2.0
+torchvision>=0.15
+numpy
+Pillow
+scikit-learn
+requests
+transformers   # 仅数据清洗脚本 clean_labels.py 需要
